@@ -42,6 +42,7 @@ import {
   assertLlmHealthy,
   reportLlmHealth,
   llmHealthLine,
+  isConnectionError,
 } from "./report.ts";
 import {
   buildCliReportContent,
@@ -68,7 +69,7 @@ import { fetchHfData, type HfData } from "./hf.ts";
 import { fetchDevtoData, type DevtoData } from "./devto.ts";
 import { fetchLobstersData, type LobstersData } from "./lobsters.ts";
 import { loadConfig } from "./config.ts";
-import { toCstDateStr, toUtcStr, weekdayOf } from "./date.ts";
+import { toCstDateStr, toUtcStr, weekdayOf, sleep } from "./date.ts";
 import {
   type Lang,
   MSG,
@@ -391,6 +392,14 @@ async function translateSummaries(en: Summaries): Promise<Summaries> {
  */
 const HF_REPORT_WEEKDAY = 1;
 
+/**
+ * Pause between the two highlights attempts when the first one died on a
+ * connection failure. Long enough that attempt 2 lands outside the outage that
+ * just consumed callLlm's retry ladder, short enough that a healthy provider
+ * hiccup still costs the run a single minute.
+ */
+const HIGHLIGHTS_COOLDOWN_MS = 60_000;
+
 async function main(): Promise<void> {
   requireEnv("GITHUB_TOKEN");
 
@@ -605,6 +614,14 @@ async function main(): Promise<void> {
   // slightly malformed JSON that repairJson can't fix (seen 2026-07-13: zh
   // failed with "Expected ',' or ']' after array element"); a fresh generation
   // usually returns valid JSON.
+  //
+  // A connection failure is a different animal: attempt 1 has already burned
+  // callLlm's full ~3 min connection ladder, so firing attempt 2 immediately
+  // re-enters an outage that is demonstrably still going. On 2026-09-19 both
+  // attempts failed back to back inside the same DashScope outage and the day
+  // shipped with an empty highlights.json — Telegram and Feishu rendered
+  // section links and no bullets. Wait out a cooldown first; a malformed-JSON
+  // retry still goes straight through.
   const attemptJson = async (label: string, prompt: string): Promise<ReportHighlights> => {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
@@ -612,6 +629,12 @@ async function main(): Promise<void> {
       } catch (err) {
         const tag = attempt < 2 ? "retrying" : "giving up";
         console.error(`  [highlights] ${label} attempt ${attempt} failed (${tag}): ${err}`);
+        if (attempt < 2 && isConnectionError(err)) {
+          console.error(
+            `  [highlights] connection down — cooling down ${HIGHLIGHTS_COOLDOWN_MS / 1000}s before retry`,
+          );
+          await sleep(HIGHLIGHTS_COOLDOWN_MS);
+        }
       }
     }
     return {};
